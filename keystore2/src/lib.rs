@@ -40,6 +40,7 @@ pub mod remote_provisioning;
 pub mod security_level;
 pub mod service;
 pub mod shared_secret_negotiation;
+mod tee_soft_debug;
 pub mod utils;
 
 mod attestation_key_utils;

@@ -89,4 +89,65 @@ extern "C" {
 int extractSubjectFromCertificate(const uint8_t* cert_buf, size_t cert_len,
                                   uint8_t* subject_buf, size_t subject_buf_len);
 
+// Parse a DER-encoded X.509 certificate contained in cert_buf, with length
+// cert_len, extract the issuer, DER-encode it and write the result to
+// issuer_buf, which has issuer_buf_len capacity.
+//
+// Return value semantics are identical to extractSubjectFromCertificate:
+// - > 0: success, number of bytes written
+// - = 0: unrecoverable failure
+// - < 0: output buffer too small, required size is -ret
+int extractIssuerFromCertificate(const uint8_t* cert_buf, size_t cert_len,
+                                 uint8_t* issuer_buf, size_t issuer_buf_len);
+
+// Re-sign a DER-encoded leaf certificate with a private key and issuer certificate.
+//
+// `signing_key_buf` supports either PEM text ("BEGIN PRIVATE KEY") or DER key bytes.
+//
+// Return value semantics:
+// - > 0: success, number of bytes written to out_cert_buf.
+// - = 0: failure.
+// - < 0: output buffer too small; required size is `-ret`.
+int resignLeafCertificate(const uint8_t* leaf_cert_buf, size_t leaf_cert_len,
+                          const uint8_t* signing_cert_buf, size_t signing_cert_len,
+                          const uint8_t* signing_key_buf, size_t signing_key_len,
+                          uint8_t* out_cert_buf, size_t out_cert_buf_len);
+
+// Verify that `child_cert_buf` is signed by `parent_cert_buf` public key.
+//
+// Return true on successful verification, false otherwise.
+bool verifyCertificateSignedBy(const uint8_t* child_cert_buf, size_t child_cert_len,
+                               const uint8_t* parent_cert_buf, size_t parent_cert_len);
+
+// Return signature key family used by certificate's signature algorithm:
+// - 1: RSA
+// - 2: EC/ECDSA
+// - 0: unknown or parse failure
+int getCertificateSignatureKeyFamily(const uint8_t* cert_buf, size_t cert_len);
+
+// Return public key family of certificate SubjectPublicKeyInfo:
+// - 1: RSA
+// - 2: EC/ECDSA
+// - 0: unknown or parse failure
+int getCertificatePublicKeyFamily(const uint8_t* cert_buf, size_t cert_len);
+
+// Return signature key family encoded in TBSCertificate.signature field:
+// - 1: RSA
+// - 2: EC/ECDSA
+// - 0: unknown or parse failure
+int getCertificateTbsSignatureKeyFamily(const uint8_t* cert_buf, size_t cert_len);
+
+// Extract patch levels from Android attestation extension (OID 1.3.6.1.4.1.11129.2.1.17).
+//
+// Output pointers may be null. If non-null and the corresponding field is found, it is written.
+//
+// Return value is a bitmask:
+// - bit 0 (0x1): OS_PATCHLEVEL found
+// - bit 1 (0x2): VENDOR_PATCHLEVEL found
+// - bit 2 (0x4): BOOT_PATCHLEVEL found
+//
+// Returns 0 if parsing fails or none of the fields are found.
+int extractAttestationPatchLevels(const uint8_t* cert_buf, size_t cert_len, int32_t* out_os_patchlevel,
+                                  int32_t* out_vendor_patchlevel, int32_t* out_boot_patchlevel);
+
 #endif  //  __CRYPTO_H__
