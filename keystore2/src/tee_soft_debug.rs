@@ -342,15 +342,28 @@ pub(crate) fn should_force_software_generation_for_uid(
         return false;
     }
 
-    let has_challenge = has_attestation_challenge(creation_params);
-    if !has_challenge {
-        return false;
-    }
+    let is_attest_key = is_attest_key_request(creation_params);
 
     match cfg.mode {
-        // Keep this path limited to explicit Generate mode until full in-process
-        // software key generation is implemented.
-        TeeSoftDebugMode::Generate => true,
+        // Match TEESimulator behavior more closely:
+        // once a target package is in explicit Generate mode, generation should be routed to
+        // SOFTWARE regardless of whether the request carries an attestation challenge.
+        // This also ensures ATTEST_KEY requests do not silently fall back to hardware just because
+        // the framework omits ATTESTATION_CHALLENGE on the attestation-key creation step.
+        TeeSoftDebugMode::Generate => {
+            if is_attest_key {
+                info!(
+                    "tee soft debug: Generate mode forcing SOFTWARE generation for ATTEST_KEY request, uid={:?}",
+                    caller_uid
+                );
+            } else if !has_attestation_challenge(creation_params) {
+                info!(
+                    "tee soft debug: Generate mode forcing SOFTWARE generation without attestation challenge, uid={:?}",
+                    caller_uid
+                );
+            }
+            true
+        }
         TeeSoftDebugMode::Patch | TeeSoftDebugMode::Auto => false,
     }
 }
@@ -1505,10 +1518,15 @@ pub(crate) fn maybe_override_certificate_chain_for_uid(
             );
         }
 
-        // For ATTEST_KEY responses, prefer returning the selected keybox native chain directly.
-        // This avoids exposing a hardware-leaf public key that may not match the software
-        // attestation-signing semantics expected by follow-up attestKeyAlias requests.
-        if let Some(mid) = selected_material.as_deref() {
+        // In Generate mode, keep the software-generated leaf and only patch/re-sign the chain so
+        // the returned certificate still matches the generated key blob's public key.
+        // The native keybox leaf can still be useful in Patch mode, where the underlying key was
+        // not software-generated and the response is only being rewritten for compatibility.
+        if matches!(action, TeeSoftDebugAction::GenerateSoftwareChain) {
+            info!(
+                "tee soft debug: ATTEST_KEY response kept patched software leaf instead of switching to native keybox chain"
+            );
+        } else if let Some(mid) = selected_material.as_deref() {
             if let Some(material) = materials.iter().find(|m| material_id(m) == mid) {
                 let native_chain = material.certs.clone();
                 if !native_chain.is_empty()

@@ -212,6 +212,7 @@ fn keymint_service_name(security_level: &SecurityLevel) -> Result<Option<String>
                 None
             }
         }
+        SecurityLevel::SOFTWARE => None,
         _ => {
             return Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)).context(ks_err!(
                 "Trying to find keymint for security level: {:?}",
@@ -250,13 +251,16 @@ fn connect_keymint(
         let km_version = km.getInterfaceVersion()?;
         (km, Some(km_version * 100))
     } else {
+        if *security_level == SecurityLevel::SOFTWARE {
+            info!("Connecting to SOFTWARE KeyMint via keystore compat service.");
+        }
         // This is a no-op if it was called before.
         keystore2_km_compat::add_keymint_device_service();
 
         let keystore_compat_service: Strong<dyn IKeystoreCompatService> =
             map_binder_status_code(binder::get_interface("android.security.compat"))
                 .context(ks_err!("Trying to connect to compat service."))?;
-        (
+        let km =
             map_binder_status(keystore_compat_service.getKeyMintDevice(*security_level))
                 .map_err(|e| match e {
                     Error::BinderTransaction(StatusCode::NAME_NOT_FOUND) => {
@@ -268,9 +272,13 @@ fn connect_keymint(
                     "Trying to get Legacy wrapper. Attempt to get keystore \
                     compat service for security level {:?}",
                     *security_level
-                ))?,
-            None,
-        )
+                ))?;
+        let hal_version = if *security_level == SecurityLevel::SOFTWARE {
+            Some(km.getInterfaceVersion()? * 100)
+        } else {
+            None
+        };
+        (km, hal_version)
     };
 
     // If the KeyMint device is back-level, use a wrapper that intercepts and

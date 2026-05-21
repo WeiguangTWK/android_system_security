@@ -165,6 +165,25 @@ impl KeystoreSecurityLevel {
         user: AndroidUserId,
         flags: Option<i32>,
     ) -> Result<KeyMetadata> {
+        self.store_new_key_with_metadata(
+            key,
+            creation_result,
+            user,
+            flags,
+            self.security_level,
+            self.km_uuid,
+        )
+    }
+
+    fn store_new_key_with_metadata(
+        &self,
+        key: KeyDescriptor,
+        creation_result: KeyCreationResult,
+        user: AndroidUserId,
+        flags: Option<i32>,
+        stored_sec_level: SecurityLevel,
+        stored_km_uuid: Uuid,
+    ) -> Result<KeyMetadata> {
         let KeyCreationResult {
             keyBlob: key_blob,
             keyCharacteristics: key_characteristics,
@@ -231,7 +250,7 @@ impl KeystoreSecurityLevel {
 
                     let mut key_metadata = KeyMetaData::new();
                     key_metadata.add(KeyMetaEntry::CreationDate(creation_date));
-                    blob_metadata.add(BlobMetaEntry::KmUuid(self.km_uuid));
+                    blob_metadata.add(BlobMetaEntry::KmUuid(stored_km_uuid));
 
                     let key_id = db
                         .store_new_key(
@@ -241,7 +260,7 @@ impl KeystoreSecurityLevel {
                             &BlobInfo::new(&key_blob, &blob_metadata),
                             &cert_info,
                             &key_metadata,
-                            &self.km_uuid,
+                            &stored_km_uuid,
                         )
                         .context(ks_err!())?;
                     Ok(KeyDescriptor {
@@ -255,7 +274,7 @@ impl KeystoreSecurityLevel {
 
         Ok(KeyMetadata {
             key,
-            keySecurityLevel: self.security_level,
+            keySecurityLevel: stored_sec_level,
             certificate: cert_info.take_cert(),
             certificateChain: cert_info.take_cert_chain(),
             authorizations: crate::utils::key_parameters_to_authorizations(key_parameters),
@@ -274,7 +293,7 @@ impl KeystoreSecurityLevel {
         // so that we can use it by reference like the blob provided by the key descriptor.
         // Otherwise, we would have to clone the blob from the key descriptor.
         let scoping_blob: Vec<u8>;
-        let (km_blob, key_properties, key_id_guard, blob_metadata) = match key.domain {
+        let (km_blob, key_properties, key_id_guard, loaded_descriptor, blob_metadata) = match key.domain {
             Domain::BLOB => {
                 check_key_permission(KeyPerm::Use, key, &None)
                     .context(ks_err!("checking use permission for Domain::BLOB."))?;
@@ -292,6 +311,7 @@ impl KeystoreSecurityLevel {
                             ));
                         }
                     },
+                    None,
                     None,
                     None,
                     BlobMetaData::new(),
@@ -322,6 +342,10 @@ impl KeystoreSecurityLevel {
                     })
                     .context(ks_err!("Failed to load key blob."))?;
 
+                let loaded_descriptor =
+                    DB.with(|db| db.borrow_mut().load_key_descriptor(key_id_guard.id()))
+                        .context(ks_err!("Failed to resolve key descriptor for debug routing."))?;
+
                 let (blob, blob_metadata) =
                     key_entry.take_key_blob_info().ok_or_else(Error::sys).context(ks_err!(
                         "Successfully loaded key entry, \
@@ -333,6 +357,7 @@ impl KeystoreSecurityLevel {
                     &scoping_blob,
                     Some((key_id_guard.id(), key_entry.into_key_parameters())),
                     Some(key_id_guard),
+                    loaded_descriptor,
                     blob_metadata,
                 )
             }
@@ -368,6 +393,27 @@ impl KeystoreSecurityLevel {
             .unwrap()
             .unwrap_key_if_required(&blob_metadata, km_blob)
             .context(ks_err!("Failed to handle super encryption."))?;
+
+        let routed_km_uuid = blob_metadata.km_uuid().copied().unwrap_or(self.km_uuid);
+        let routed_sec_level = blob_metadata
+            .km_uuid()
+            .copied()
+            .map(|uuid| {
+                get_keymint_dev_by_uuid(&uuid)
+                    .map(|(_, hw_info)| hw_info.securityLevel)
+                    .unwrap_or(self.security_level)
+            })
+            .unwrap_or(self.security_level);
+        info!(
+            "tee soft debug: create_operation routing key={:?}, caller_uid={:?}, loaded_descriptor={:?}, km_uuid={:?}, routed_sec_level={:?}, forced={}, purpose={:?}",
+            key,
+            caller_uid,
+            loaded_descriptor,
+            routed_km_uuid,
+            routed_sec_level,
+            forced,
+            purpose
+        );
 
         let (begin_result, upgraded_blob) = self
             .upgrade_keyblob_if_required_with(
@@ -666,20 +712,51 @@ impl KeystoreSecurityLevel {
             has_external_attestation_key,
             uses_tracked_attest_key,
         );
-        // NOTE: Many devices do not expose a usable SOFTWARE KeyMint binder service.
-        // Keep this route disabled until in-process software key generation is implemented.
-        let force_software_generation = false;
         if requested_software_generation {
             info!(
-                "tee soft debug: software-generation requested for uid={:?}, but system SOFTWARE KeyMint route is disabled; using original generation path",
-                caller_uid
+                "tee soft debug: software-generation requested for uid={:?}, has_external_attestation_key={}, uses_tracked_attest_key={}, alias={:?}",
+                caller_uid,
+                has_external_attestation_key,
+                uses_tracked_attest_key,
+                key.alias
             );
         }
+        let force_software_generation = if requested_software_generation
+            && !has_external_attestation_key
+        {
+            info!(
+                "tee soft debug: enabling SOFTWARE KeyMint generation path for uid={:?}, alias={:?}",
+                caller_uid,
+                key.alias
+            );
+            true
+        } else if requested_software_generation {
+            info!(
+                "tee soft debug: software-generation requested but deferred to original path because an external attestation key is involved, uid={:?}, alias={:?}",
+                caller_uid,
+                key.alias
+            );
+            false
+        } else {
+            false
+        };
         let mut used_software_generation = false;
+        let mut effective_generation_security_level = self.security_level;
+        let mut effective_generation_km_uuid = self.km_uuid;
         let software_attempt = if force_software_generation {
             match get_keymint_device(&SecurityLevel::SOFTWARE) {
-                Ok((soft_km_dev, _, _)) => {
+                Ok((soft_km_dev, soft_hw_info, soft_km_uuid)) => {
                     used_software_generation = true;
+                    effective_generation_security_level = soft_hw_info.securityLevel;
+                    effective_generation_km_uuid = soft_km_uuid;
+                    info!(
+                        "tee soft debug: invoking SOFTWARE IKeyMintDevice::generateKey for uid={:?}, alias={:?}, km_uuid={:?}, reported_sec_level={:?}, version={}",
+                        caller_uid,
+                        key.alias,
+                        soft_km_uuid,
+                        soft_hw_info.securityLevel,
+                        soft_hw_info.versionNumber
+                    );
                     Some(
                         map_km_error({
                             let _wp = self.watch_millis(
@@ -702,6 +779,7 @@ impl KeystoreSecurityLevel {
                         "tee soft debug: SOFTWARE KeyMint unavailable, fallback to original generation path for uid={:?}: {:?}",
                         caller_uid, e
                     );
+                    used_software_generation = false;
                     None
                 }
             }
@@ -721,7 +799,21 @@ impl KeystoreSecurityLevel {
                 let (attest_km_dev, attest_km_version) =
                     if let Some(km_uuid) = blob_metadata.km_uuid().copied() {
                         match get_keymint_dev_by_uuid(&km_uuid) {
-                            Ok((dev, hw_info)) => (dev, hw_info.versionNumber),
+                            Ok((dev, hw_info)) => {
+                                effective_generation_security_level = hw_info.securityLevel;
+                                effective_generation_km_uuid = km_uuid;
+                                used_software_generation =
+                                    hw_info.securityLevel == SecurityLevel::SOFTWARE;
+                                info!(
+                                    "tee soft debug: using user-generated attestation key via km_uuid={:?}, sec_level={:?}, version={}, alias={:?}, attest_alias={:?}",
+                                    km_uuid,
+                                    hw_info.securityLevel,
+                                    hw_info.versionNumber,
+                                    key.alias,
+                                    attest_key_descriptor.and_then(|d| d.alias.as_deref())
+                                );
+                                (dev, hw_info.versionNumber)
+                            }
                             Err(e) => {
                                 error!(
                                     "Failed to resolve keymint by uuid {:?} for user-generated attest key, fallback to current security level: {:?}",
@@ -856,7 +948,22 @@ impl KeystoreSecurityLevel {
         mark_generated_attest_key_for_uid(caller_uid, &key, &params, used_software_generation);
 
         let user = caller_uid.owning_user();
-        self.store_new_key(key, creation_result, user, Some(flags)).context(ks_err!())
+        info!(
+            "tee soft debug: storing generated key alias={:?} with effective sec_level={:?}, km_uuid={:?}, used_software_generation={}",
+            key.alias,
+            effective_generation_security_level,
+            effective_generation_km_uuid,
+            used_software_generation
+        );
+        self.store_new_key_with_metadata(
+            key,
+            creation_result,
+            user,
+            Some(flags),
+            effective_generation_security_level,
+            effective_generation_km_uuid,
+        )
+        .context(ks_err!())
     }
 
     fn import_key(

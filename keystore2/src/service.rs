@@ -88,10 +88,26 @@ impl KeystoreService {
 
         // Strongbox is optional, so we ignore errors and turn the result into an Option.
         if let Ok((dev, uuid)) =
-            KeystoreSecurityLevel::new_native_binder(SecurityLevel::STRONGBOX, id_rotation_state)
+            KeystoreSecurityLevel::new_native_binder(
+                SecurityLevel::STRONGBOX,
+                id_rotation_state.clone(),
+            )
         {
             result.i_sec_level_by_uuid.insert(uuid, dev);
             result.uuid_by_sec_level.insert(SecurityLevel::STRONGBOX, uuid);
+        }
+
+        // SOFTWARE is optional from the service-construction perspective, but required for
+        // tee soft debug Generate mode. Register it when available so software-generated keys
+        // can round-trip through getKeyEntry/export paths.
+        if let Ok((dev, uuid)) =
+            KeystoreSecurityLevel::new_native_binder(
+                SecurityLevel::SOFTWARE,
+                id_rotation_state.clone(),
+            )
+        {
+            result.i_sec_level_by_uuid.insert(uuid, dev);
+            result.uuid_by_sec_level.insert(SecurityLevel::SOFTWARE, uuid);
         }
 
         let uuid_by_sec_level = result.uuid_by_sec_level.clone();
@@ -239,9 +255,11 @@ impl KeystoreService {
         let exported_summary =
             Self::summarize_exported_chain(certificate.as_deref(), certificate_chain.as_deref());
         info!(
-            "keystore2 export: key={:?}, caller_uid={:?}, exported_chain_summary={:?}",
+            "keystore2 export: key={:?}, caller_uid={:?}, key_sec_level={:?}, i_sec_level_present={}, exported_chain_summary={:?}",
             key,
             caller_uid,
+            self.uuid_to_sec_level(key_entry.km_uuid()),
+            i_sec_level.is_some(),
             exported_summary
         );
 
