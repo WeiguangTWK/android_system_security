@@ -394,16 +394,21 @@ impl KeystoreSecurityLevel {
             .unwrap_key_if_required(&blob_metadata, km_blob)
             .context(ks_err!("Failed to handle super encryption."))?;
 
-        let routed_km_uuid = blob_metadata.km_uuid().copied().unwrap_or(self.km_uuid);
-        let routed_sec_level = blob_metadata
-            .km_uuid()
-            .copied()
-            .map(|uuid| {
-                get_keymint_dev_by_uuid(&uuid)
-                    .map(|(_, hw_info)| hw_info.securityLevel)
-                    .unwrap_or(self.security_level)
-            })
-            .unwrap_or(self.security_level);
+        let (routed_km_dev, routed_km_version, routed_km_uuid, routed_sec_level) =
+            if let Some(km_uuid) = blob_metadata.km_uuid().copied() {
+                match get_keymint_dev_by_uuid(&km_uuid) {
+                    Ok((dev, hw_info)) => (dev, hw_info.versionNumber, km_uuid, hw_info.securityLevel),
+                    Err(e) => {
+                        warn!(
+                            "tee soft debug: failed to resolve routed KeyMint device by uuid {:?}, falling back to current binder device: {:?}",
+                            km_uuid, e
+                        );
+                        (self.keymint.clone(), self.hw_info.versionNumber, self.km_uuid, self.security_level)
+                    }
+                }
+            } else {
+                (self.keymint.clone(), self.hw_info.versionNumber, self.km_uuid, self.security_level)
+            };
         info!(
             "tee soft debug: create_operation routing key={:?}, caller_uid={:?}, loaded_descriptor={:?}, km_uuid={:?}, routed_sec_level={:?}, forced={}, purpose={:?}",
             key,
@@ -415,8 +420,11 @@ impl KeystoreSecurityLevel {
             purpose
         );
 
+        let routed_km_ctx =
+            KeymintUpgradeCtx { dev: &*routed_km_dev, version: routed_km_version };
         let (begin_result, upgraded_blob) = self
-            .upgrade_keyblob_if_required_with(
+            .upgrade_keyblob_if_required_with_dev(
+                routed_km_ctx,
                 key_id_guard,
                 &km_blob,
                 blob_metadata.km_uuid().copied(),
@@ -424,9 +432,9 @@ impl KeystoreSecurityLevel {
                 |blob| loop {
                     match map_km_error({
                         let _wp = self.watch(
-                            "KeystoreSecurityLevel::create_operation: calling IKeyMintDevice::begin",
+                            "KeystoreSecurityLevel::create_operation: calling routed IKeyMintDevice::begin",
                         );
-                        self.keymint.begin(
+                        routed_km_dev.begin(
                             purpose,
                             blob,
                             operation_parameters,
@@ -466,7 +474,13 @@ impl KeystoreSecurityLevel {
                 caller_uid,
                 auth_info,
                 forced,
-                LoggingInfo::new(self.security_level, purpose, op_params, upgraded_blob.is_some()),
+                LoggingInfo::new(
+                    routed_sec_level,
+                    purpose,
+                    op_params,
+                    upgraded_blob.is_some(),
+                    loaded_descriptor.as_ref().and_then(|d| d.alias.clone()),
+                ),
             ),
             None => {
                 return Err(Error::sys()).context(ks_err!(

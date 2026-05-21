@@ -143,7 +143,7 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     IKeystoreOperation::BnKeystoreOperation, IKeystoreOperation::IKeystoreOperation,
 };
 use anyhow::{anyhow, Context, Result};
-use log::{error, warn};
+use log::{error, info, warn};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, Weak},
@@ -192,6 +192,7 @@ pub struct LoggingInfo {
     purpose: KeyPurpose,
     op_params: Vec<KeyParameter>,
     key_upgraded: bool,
+    key_alias: Option<String>,
 }
 
 impl LoggingInfo {
@@ -201,8 +202,9 @@ impl LoggingInfo {
         purpose: KeyPurpose,
         op_params: Vec<KeyParameter>,
         key_upgraded: bool,
+        key_alias: Option<String>,
     ) -> LoggingInfo {
-        Self { sec_level, purpose, op_params, key_upgraded }
+        Self { sec_level, purpose, op_params, key_upgraded, key_alias }
     }
 }
 
@@ -241,6 +243,24 @@ impl Operation {
     fn watch(&self, id: &'static str) -> Option<wd::WatchPoint> {
         let sec_level = self.logging_info.sec_level;
         wd::watch_millis_with(id, wd::DEFAULT_TIMEOUT_MS, sec_level)
+    }
+
+    fn should_log_softdebug_stage(&self) -> bool {
+        self.logging_info.sec_level == SecurityLevel::SOFTWARE
+    }
+
+    fn log_softdebug_stage(&self, stage: &str, detail: &str) {
+        if self.should_log_softdebug_stage() {
+            info!(
+                "tee soft debug: operation stage={} alias={:?} owner={:?} index={} purpose={:?} detail={}",
+                stage,
+                self.logging_info.key_alias,
+                self.owner,
+                self.index,
+                self.logging_info.purpose,
+                detail
+            );
+        }
     }
 
     fn get_pruning_info(&self) -> Option<PruningInfo> {
@@ -359,6 +379,7 @@ impl Operation {
         let mut outcome = self.check_active().context("In update_aad")?;
         Self::check_input_length(aad_input).context("In update_aad")?;
         self.touch();
+        self.log_softdebug_stage("updateAad.begin", &format!("aad_len={}", aad_input.len()));
 
         let (hat, tst) = self
             .auth_info
@@ -367,13 +388,22 @@ impl Operation {
             .before_update()
             .context(ks_err!("Trying to get auth tokens for {:?}", self.owner))?;
 
-        self.update_outcome(&mut outcome, {
+        let result = self.update_outcome(&mut outcome, {
             let _wp = self.watch("Operation::update_aad: calling IKeyMintOperation::updateAad");
             map_km_error(self.km_op.updateAad(aad_input, hat.as_ref(), tst.as_ref()))
         })
-        .context(ks_err!("Update failed for {:?}", self.owner))?;
+        .context(ks_err!("Update failed for {:?}", self.owner));
 
-        Ok(())
+        match result {
+            Ok(()) => {
+                self.log_softdebug_stage("updateAad.ok", "completed");
+                Ok(())
+            }
+            Err(e) => {
+                self.log_softdebug_stage("updateAad.err", &format!("{e:?}"));
+                Err(e)
+            }
+        }
     }
 
     /// Implementation of `IKeystoreOperation::update`.
@@ -382,6 +412,7 @@ impl Operation {
         let mut outcome = self.check_active().context("In update")?;
         Self::check_input_length(input).context("In update")?;
         self.touch();
+        self.log_softdebug_stage("update.begin", &format!("input_len={}", input.len()));
 
         let (hat, tst) = self
             .auth_info
@@ -390,12 +421,23 @@ impl Operation {
             .before_update()
             .context(ks_err!("Trying to get auth tokens for {:?}", self.owner))?;
 
-        let output = self
+        let result = self
             .update_outcome(&mut outcome, {
                 let _wp = self.watch("Operation::update: calling IKeyMintOperation::update");
                 map_km_error(self.km_op.update(input, hat.as_ref(), tst.as_ref()))
             })
-            .context(ks_err!("Update failed for {:?}", self.owner))?;
+            .context(ks_err!("Update failed for {:?}", self.owner));
+
+        let output = match result {
+            Ok(output) => {
+                self.log_softdebug_stage("update.ok", &format!("output_len={}", output.len()));
+                output
+            }
+            Err(e) => {
+                self.log_softdebug_stage("update.err", &format!("{e:?}"));
+                return Err(e);
+            }
+        };
 
         if output.is_empty() {
             Ok(None)
@@ -412,6 +454,14 @@ impl Operation {
             Self::check_input_length(input).context("In finish")?;
         }
         self.touch();
+        self.log_softdebug_stage(
+            "finish.begin",
+            &format!(
+                "input_len={} signature_len={}",
+                input.map_or(0, |v| v.len()),
+                signature.map_or(0, |v| v.len())
+            ),
+        );
 
         let (hat, tst, confirmation_token) = self
             .auth_info
@@ -420,7 +470,7 @@ impl Operation {
             .before_finish()
             .context(ks_err!("Trying to get auth tokens for {:?}", self.owner))?;
 
-        let output = self
+        let result = self
             .update_outcome(&mut outcome, {
                 let _wp = self.watch("Operation::finish: calling IKeyMintOperation::finish");
                 map_km_error(self.km_op.finish(
@@ -431,12 +481,21 @@ impl Operation {
                     confirmation_token.as_deref(),
                 ))
             })
-            .context(ks_err!("Finish failed for {:?}", self.owner))?;
+            .context(ks_err!("Finish failed for {:?}", self.owner));
+
+        let output = match result {
+            Ok(output) => output,
+            Err(e) => {
+                self.log_softdebug_stage("finish.err", &format!("{e:?}"));
+                return Err(e);
+            }
+        };
 
         self.auth_info.lock().unwrap().after_finish().context("In finish.")?;
 
         // At this point the operation concluded successfully.
         *outcome = Outcome::Success;
+        self.log_softdebug_stage("finish.ok", &format!("output_len={}", output.len()));
 
         if output.is_empty() {
             Ok(None)
@@ -451,10 +510,22 @@ impl Operation {
     fn abort(&self, outcome: Outcome) -> Result<()> {
         let mut locked_outcome = self.check_active().context("In abort")?;
         *locked_outcome = outcome;
+        self.log_softdebug_stage("abort.begin", &format!("outcome={:?}", outcome));
 
-        {
+        let result = {
             let _wp = self.watch("Operation::abort: calling IKeyMintOperation::abort");
             map_km_error(self.km_op.abort()).context(ks_err!("KeyMint::abort failed."))
+        };
+
+        match result {
+            Ok(()) => {
+                self.log_softdebug_stage("abort.ok", "completed");
+                Ok(())
+            }
+            Err(e) => {
+                self.log_softdebug_stage("abort.err", &format!("{e:?}"));
+                Err(e)
+            }
         }
     }
 }
